@@ -183,6 +183,25 @@ private const val INSTRUMENT_CMD =
 
 private fun isValidPort(port: Int?) = port != null && port in 1..65535
 
+/** True when adbd rejected our key, i.e. this install hasn't been paired via Wireless Debugging. */
+private fun isNotPairedError(e: Throwable): Boolean {
+    val text = generateSequence(e) { it.cause }.joinToString(" ") { it.message.orEmpty() }
+    return "CERTIFICATE_UNKNOWN" in text || "CERTIFICATE_REQUIRED" in text
+}
+
+/** Turns low-level ADB/TLS exceptions into a message a user can act on. */
+private fun friendlyAdbError(e: Throwable): String {
+    val text = generateSequence(e) { it.cause }.joinToString(" ") { it.message.orEmpty() }
+    return when {
+        isNotPairedError(e) -> "尚未配对：请点按「无线调试」，选择「使用配对码配对设备」，然后在通知栏输入配对码"
+        "ECONNREFUSED" in text || "Connection refused" in text ->
+            "无法连接无线调试，请确认「无线调试」已开启"
+        "timed out" in text || "timeout" in text.lowercase() ->
+            "连接无线调试超时，请确认手机仍连接着 Wi‑Fi"
+        else -> e.message ?: e.javaClass.simpleName
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun MainScreen() {
@@ -337,7 +356,12 @@ fun MainScreen() {
             result.onFailure { error ->
                 isApplying = false
                 isInstrumenting.set(false)
-                showMessage("${if (clear) "恢复" else "激活"}失败：${error.message}")
+                // A rejected key means pairing was lost; re-run the authorization check.
+                if (isNotPairedError(error)) {
+                    isAuthorized = false
+                    authEpoch++
+                }
+                showMessage("${if (clear) "恢复" else "激活"}失败：${friendlyAdbError(error)}")
                 return@launch
             }
 
@@ -490,6 +514,7 @@ fun MainScreen() {
             item(key = "actions") {
                 ActionSection(
                     hasPort = portInput.isNotEmpty(),
+                    isAuthorized = isAuthorized,
                     isApplying = isApplying,
                     onApply = { triggerApply() },
                     onRestore = { showRestoreDialog = true }
@@ -915,7 +940,7 @@ private fun ConnectionSection(
     val debugSupporting = when {
         isAuthorized -> "已配对并授权"
         !hasLocalNetwork && portInput.isEmpty() -> "需要「附近设备」权限才能自动发现端口"
-        portInput.isNotEmpty() -> "无线调试已开启，点按此处配对"
+        portInput.isNotEmpty() -> "尚未配对 · 点按后选择「使用配对码配对设备」，在通知栏输入配对码"
         else -> "点按前往开启无线调试并配对"
     }
 
@@ -983,6 +1008,7 @@ private fun ConnectionSection(
 @Composable
 private fun ActionSection(
     hasPort: Boolean,
+    isAuthorized: Boolean,
     isApplying: Boolean,
     onApply: () -> Unit,
     onRestore: () -> Unit
@@ -993,7 +1019,7 @@ private fun ActionSection(
     ) {
         Button(
             onClick = onApply,
-            enabled = hasPort && !isApplying,
+            enabled = isAuthorized && !isApplying,
             modifier = Modifier.fillMaxWidth().height(56.dp)
         ) {
             if (isApplying) {
@@ -1006,12 +1032,19 @@ private fun ActionSection(
             } else {
                 Icon(Icons.Filled.Bolt, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text(if (hasPort) "一键激活" else "等待开启无线调试…", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    when {
+                        isAuthorized -> "一键激活"
+                        hasPort -> "请先完成配对"
+                        else -> "等待开启无线调试…"
+                    },
+                    style = MaterialTheme.typography.titleMedium
+                )
             }
         }
         OutlinedButton(
             onClick = onRestore,
-            enabled = hasPort && !isApplying,
+            enabled = isAuthorized && !isApplying,
             modifier = Modifier.fillMaxWidth().height(48.dp)
         ) {
             Icon(Icons.Filled.Restore, contentDescription = null, modifier = Modifier.size(ButtonIconSize))
