@@ -46,7 +46,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.SegmentedListItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
@@ -84,6 +85,11 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -147,7 +153,14 @@ fun MainScreen() {
     var slotStatuses by remember {
         mutableStateOf(List(2) { SlotStatus(CarrierOverrides.State.UNKNOWN, ImsStatus.UNREGISTERED) })
     }
+    // Re-read permission state whenever a permission request completes.
+    val permissionEpoch = (context as? MainActivity)?.permissionEpoch?.intValue ?: 0
     var hasPhonePermission by remember { mutableStateOf(CarrierOverrides.hasPhonePermission(context)) }
+    var hasLocalNetwork by remember { mutableStateOf(Permissions.hasLocalNetwork(context)) }
+    LaunchedEffect(permissionEpoch) {
+        hasPhonePermission = CarrierOverrides.hasPhonePermission(context)
+        hasLocalNetwork = Permissions.hasLocalNetwork(context)
+    }
 
     fun showMessage(text: String) {
         scope.launch { snackbarHostState.showSnackbar(text) }
@@ -158,6 +171,7 @@ fun MainScreen() {
         while (true) {
             slotStatuses = withContext(Dispatchers.IO) { readSlotStatuses(context) }
             hasPhonePermission = CarrierOverrides.hasPhonePermission(context)
+            hasLocalNetwork = Permissions.hasLocalNetwork(context)
             delay(2000)
         }
     }
@@ -339,13 +353,27 @@ fun MainScreen() {
                     )
                 }
             }
+            if (!hasLocalNetwork) {
+                item(key = "local-network") {
+                    Banner(
+                        icon = Icons.Filled.Info,
+                        text = "需要「附近设备」权限，才能自动发现无线调试端口。",
+                        actionLabel = "去授权",
+                        onAction = {
+                            (context as? MainActivity)?.requestPermissionOrOpenSettings(android.Manifest.permission.ACCESS_LOCAL_NETWORK)
+                        }
+                    )
+                }
+            }
             if (!hasPhonePermission) {
                 item(key = "permission") {
                     Banner(
                         icon = Icons.Filled.Info,
                         text = "授予「电话」权限后，才能检测配置是否仍然生效。",
                         actionLabel = "去授权",
-                        onAction = { (context as? MainActivity)?.openAppSettings() }
+                        onAction = {
+                            (context as? MainActivity)?.requestPermissionOrOpenSettings(android.Manifest.permission.READ_PHONE_STATE)
+                        }
                     )
                 }
             }
@@ -372,6 +400,7 @@ fun MainScreen() {
             item(key = "connection") {
                 ConnectionSection(
                     authEpoch = authEpoch,
+                    hasLocalNetwork = hasLocalNetwork,
                     portInput = portInput,
                     onPortInputChange = { portInput = it }
                 )
@@ -505,7 +534,11 @@ private fun StatusLine(badge: Badge) {
     }
 }
 
-/** A list item rendered as one segment of an Android-Settings-style grouped list. */
+/**
+ * One segment of an Android-Settings-style grouped list (Material 3 Expressive
+ * [SegmentedListItem]). Clickable when [onClick] is set.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun SegmentedItem(
     index: Int,
@@ -516,29 +549,68 @@ private fun SegmentedItem(
     onClick: (() -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null
 ) {
-    Surface(
-        shape = segmentedShape(index, count),
-        color = MaterialTheme.colorScheme.surfaceBright,
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        ListItem(
-            modifier = if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier,
-            headlineContent = { Text(headline) },
-            supportingContent = supporting?.let { { Text(it) } },
-            leadingContent = icon?.let { { Icon(it, contentDescription = null) } },
+    val shapes = ListItemDefaults.segmentedShapes(index = index, count = count)
+    val colors = ListItemDefaults.segmentedColors()
+    val leading: (@Composable () -> Unit)? = icon?.let { { Icon(it, contentDescription = null) } }
+    val supportingContent: (@Composable () -> Unit)? = supporting?.let { { Text(it) } }
+    if (onClick != null) {
+        SegmentedListItem(
+            onClick = onClick,
+            shapes = shapes,
+            leadingContent = leading,
             trailingContent = trailing,
-            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-        )
+            supportingContent = supportingContent,
+            colors = colors
+        ) { Text(headline) }
+    } else {
+        SegmentedListItem(
+            shapes = shapes,
+            leadingContent = leading,
+            trailingContent = trailing,
+            supportingContent = supportingContent,
+            colors = colors
+        ) { Text(headline) }
     }
 }
 
+/**
+ * A segmented list item whose whole row toggles a switch, like Android Settings. Uses the
+ * click overload (the toggleable one tints the row as "selected" and announces a checkbox)
+ * and adds switch semantics itself.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun SegmentedSwitchItem(
+    index: Int,
+    count: Int,
+    headline: String,
+    supporting: String,
+    icon: ImageVector,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    SegmentedListItem(
+        onClick = { onCheckedChange(!checked) },
+        modifier = Modifier.semantics {
+            role = Role.Switch
+            toggleableState = ToggleableState(checked)
+        },
+        shapes = ListItemDefaults.segmentedShapes(index = index, count = count),
+        leadingContent = { Icon(icon, contentDescription = null) },
+        trailingContent = { CheckSwitch(checked, onCheckedChange = null) },
+        supportingContent = { Text(supporting) },
+        colors = ListItemDefaults.segmentedColors()
+    ) { Text(headline) }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun SegmentedColumn(content: @Composable () -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) { content() }
+    Column(verticalArrangement = Arrangement.spacedBy(ListItemDefaults.SegmentedGap)) { content() }
 }
 
 @Composable
-private fun CheckSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+private fun CheckSwitch(checked: Boolean, onCheckedChange: ((Boolean) -> Unit)?) {
     Switch(
         checked = checked,
         onCheckedChange = onCheckedChange,
@@ -599,14 +671,14 @@ private fun FeatureSettings(
                     prefs.edit().putBoolean(prefKey, value).putBoolean("clear_slot_$selectedSlot", false).commit()
                     editEpoch++
                 }
-                SegmentedItem(
+                SegmentedSwitchItem(
                     index = index,
                     count = FEATURES.size,
                     headline = feature.title,
                     supporting = feature.description,
                     icon = feature.icon,
-                    onClick = { toggle(!checked) },
-                    trailing = { CheckSwitch(checked, ::toggle) }
+                    checked = checked,
+                    onCheckedChange = ::toggle
                 )
             }
         }
@@ -646,6 +718,7 @@ private fun StatusIcon(ok: Boolean, pendingColor: Color = MaterialTheme.colorSch
 @Composable
 private fun ConnectionSection(
     authEpoch: Int,
+    hasLocalNetwork: Boolean,
     portInput: String,
     onPortInputChange: (String) -> Unit
 ) {
@@ -710,8 +783,10 @@ private fun ConnectionSection(
         }
     }
 
-    // Auto-discover the connect and pairing ports via mDNS (Network Service Discovery)
-    DisposableEffect(Unit) {
+    // Auto-discover the connect and pairing ports via mDNS (Network Service Discovery).
+    // On Android 17+ this needs ACCESS_LOCAL_NETWORK; restart discovery once it's granted.
+    DisposableEffect(hasLocalNetwork) {
+        if (!hasLocalNetwork) return@DisposableEffect onDispose {}
         val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
 
         fun listener(serviceTypeFragment: String, onPort: (Int) -> Unit) = object : NsdManager.DiscoveryListener {
@@ -760,6 +835,7 @@ private fun ConnectionSection(
 
     val debugSupporting = when {
         isAuthorized -> "已配对并授权"
+        !hasLocalNetwork && portInput.isEmpty() -> "需要「附近设备」权限才能自动发现端口"
         portInput.isNotEmpty() -> "无线调试已开启，点按此处配对"
         else -> "点按前往开启无线调试并配对"
     }
@@ -824,6 +900,7 @@ private fun ConnectionSection(
     }
 }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun ActionSection(
     hasPort: Boolean,
@@ -841,9 +918,8 @@ private fun ActionSection(
             modifier = Modifier.fillMaxWidth().height(56.dp)
         ) {
             if (isApplying) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(20.dp),
-                    strokeWidth = 2.dp,
+                LoadingIndicator(
+                    modifier = Modifier.size(28.dp),
                     color = MaterialTheme.colorScheme.onPrimary
                 )
                 Spacer(Modifier.width(12.dp))

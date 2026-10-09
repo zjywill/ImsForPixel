@@ -7,7 +7,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -17,6 +16,8 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
 import com.flyfishxu.kadb.Kadb
 import kotlinx.coroutines.Dispatchers
@@ -29,9 +30,28 @@ class MainActivity : ComponentActivity() {
         @JvmStatic
         var pairingPort: Int? = null
         var onAuthStatusChanged: (() -> Unit)? = null
+        private const val KEY_ASKED_PERMISSIONS = "asked_permissions"
     }
 
     private var pairingReceiver: BroadcastReceiver? = null
+
+    /** Bumped whenever a permission request completes, so the UI re-reads permission state. */
+    val permissionEpoch = androidx.compose.runtime.mutableIntStateOf(0)
+
+    private val startupPermissionsLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+            permissionEpoch.intValue++
+        }
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            permissionEpoch.intValue++
+            if (granted) {
+                showPairingNotification()
+            } else {
+                Toast.makeText(this, "需要通知权限来在通知栏输入配对码", Toast.LENGTH_LONG).show()
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -74,23 +94,14 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(pairingReceiver, filter, 2) // RECEIVER_NOTEXPORTED is 2
-        } else {
-            registerReceiver(pairingReceiver, filter)
-        }
+        ContextCompat.registerReceiver(this, pairingReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
-        // READ_PHONE_STATE lets us read the live carrier config to verify the overrides are in effect.
-        val missing = mutableListOf<String>()
-        if (checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
-            missing += android.Manifest.permission.READ_PHONE_STATE
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            missing += android.Manifest.permission.POST_NOTIFICATIONS
-        }
+        // READ_PHONE_STATE: verify overrides against the live carrier config.
+        // POST_NOTIFICATIONS: pairing-code input and activation results.
+        // ACCESS_LOCAL_NETWORK (Android 17+): mDNS discovery of the Wireless Debugging ports.
+        val missing = Permissions.missingAtStartup(this)
         if (missing.isNotEmpty()) {
-            requestPermissions(missing.toTypedArray(), 102)
+            launchPermissionRequest(missing)
         }
 
         setContent {
@@ -108,30 +119,34 @@ class MainActivity : ComponentActivity() {
     }
 
     fun requestNotificationPermissionAndShow() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
-            } else {
-                showPairingNotification()
-            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            !Permissions.isGranted(this, android.Manifest.permission.POST_NOTIFICATIONS)) {
+            notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
         } else {
             showPairingNotification()
         }
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 101) {
-            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                showPairingNotification()
-            } else {
-                Toast.makeText(this, "需要通知权限来在通知栏输入配对码", Toast.LENGTH_LONG).show()
-            }
+    /**
+     * Asks for a runtime permission; if the system won't show the dialog any more (the user
+     * denied it permanently), opens the app's settings page instead.
+     */
+    fun requestPermissionOrOpenSettings(permission: String) {
+        if (Permissions.isGranted(this, permission)) return
+        val asked = CarrierOverrides.prefs(this).getStringSet(KEY_ASKED_PERMISSIONS, emptySet())!!
+        if (permission in asked && !shouldShowRequestPermissionRationale(permission)) {
+            openAppSettings()
+        } else {
+            launchPermissionRequest(listOf(permission))
         }
+    }
+
+    /** Requests [permissions], remembering that we asked so a permanent denial can be detected later. */
+    private fun launchPermissionRequest(permissions: List<String>) {
+        val prefs = CarrierOverrides.prefs(this)
+        val asked = prefs.getStringSet(KEY_ASKED_PERMISSIONS, emptySet())!!
+        prefs.edit().putStringSet(KEY_ASKED_PERMISSIONS, asked + permissions).apply()
+        startupPermissionsLauncher.launch(permissions.toTypedArray())
     }
 
     private fun createNotificationChannel() {

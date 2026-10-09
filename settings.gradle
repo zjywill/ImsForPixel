@@ -11,7 +11,7 @@ dependencyResolutionManagement {
         google()
         mavenCentral()
         // Required by Kadb's transitive dependency (spake2-java)
-        maven { url 'https://jitpack.io' }
+        maven { url = 'https://jitpack.io' }
     }
 }
 

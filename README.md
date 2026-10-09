@@ -126,9 +126,10 @@ Download the latest APK from [Releases](../../releases) and install it, or build
 
 ### Prerequisites
 
-- Android Studio (Ladybug or later recommended)
-- JDK 17 (bundled with Android Studio)
-- Android SDK API 36
+- Android Studio with Android Gradle Plugin 9.1 support
+- JDK 17 or newer (bundled with Android Studio)
+- Android SDK Platform 37 (Android 17)
+- Gradle 9.3.1 (downloaded automatically by the wrapper)
 
 ### Build Debug
 
@@ -184,6 +185,7 @@ app/src/main/java/com/svenuks/imsforpixel/
 | `INTERNET` | Required by Kadb for local loopback ADB socket |
 | `ACCESS_NETWORK_STATE` | Check Wi-Fi connectivity before ADB pairing |
 | `CHANGE_WIFI_MULTICAST_STATE` | mDNS (NSD) discovery of the Wireless Debugging port |
+| `ACCESS_LOCAL_NETWORK` | Android 17+: required for mDNS discovery of the Wireless Debugging port (shown as "Nearby devices") |
 | `POST_NOTIFICATIONS` | Show activation result and pairing code in notification bar |
 | `READ_PHONE_STATE` | Read the live carrier config to verify the overrides are in effect |
 | `RECEIVE_BOOT_COMPLETED` | Detect system updates that wiped the overrides |
@@ -196,10 +198,10 @@ app/src/main/java/com/svenuks/imsforpixel/
 
 | Library | Version | Purpose |
 |---|---|---|
-| [androidx.core:core-ktx](https://developer.android.com/jetpack/androidx/releases/core) | 1.17.0 | Kotlin extensions |
+| [androidx.core:core-ktx](https://developer.android.com/jetpack/androidx/releases/core) | 1.19.1 | Kotlin extensions |
 | [androidx.activity:activity-compose](https://developer.android.com/jetpack/androidx/releases/activity) | 1.13.0 | Compose activity, edge-to-edge |
-| [androidx.compose BOM](https://developer.android.com/jetpack/compose/bom) | 2026.06.01 | Compose UI |
-| [androidx.compose.material3](https://developer.android.com/jetpack/androidx/releases/compose-material3) | 1.5.0-alpha16 | Material 3 Expressive components |
+| [androidx.compose BOM](https://developer.android.com/jetpack/compose/bom) | 2026.09.00 | Compose UI |
+| [androidx.compose.material3](https://developer.android.com/jetpack/androidx/releases/compose-material3) | 1.5.0-beta01 | Material 3 Expressive components (SegmentedListItem, LoadingIndicator, flexible app bars) |
 | [hiddenapibypass](https://github.com/LSPosed/HiddenApiBypass) | 4.3 | Restricted telephony API access on Android 9+ |
 | [kadb](https://github.com/flyfishxu/Kadb) | 2.1.1 | Pure-Kotlin ADB over Wi-Fi |
 
