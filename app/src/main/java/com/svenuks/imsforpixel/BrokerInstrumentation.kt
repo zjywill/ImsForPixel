@@ -183,7 +183,7 @@ class BrokerInstrumentation : Instrumentation() {
     }
 
     /** Per-slot outcome of one broker run. */
-    private data class SlotResult(val slot: Int, val configWritten: Boolean, var imsRegistered: Boolean)
+    private data class SlotResult(val slot: Int, val label: String, val configWritten: Boolean, var imsRegistered: Boolean)
 
     /**
      * Invokes CarrierConfigManager.overrideConfig, preferring the 3-arg (persistent) overload.
@@ -259,7 +259,8 @@ class BrokerInstrumentation : Instrumentation() {
                     CarrierOverrides.restoreActivation(sharedPrefs, slotIndex, previous)
                 }
             }
-            results += SlotResult(slotIndex, written, false)
+            val label = subInfo.displayName?.toString()?.takeIf { it.isNotBlank() } ?: "SIM ${slotIndex + 1}"
+            results += SlotResult(slotIndex, label, written, false)
 
             // Reset IMS registration to force reload
             try {
@@ -332,13 +333,13 @@ class BrokerInstrumentation : Instrumentation() {
             sorted.any { !it.configWritten } -> {
                 title = if (isActivate) "❌ 配置写入失败" else "❌ 恢复失败"
                 body = sorted.joinToString("  ") {
-                    "SIM ${it.slot + 1}: " + if (it.configWritten) "成功" else "失败"
+                    "${it.label}: " + if (it.configWritten) "成功" else "失败"
                 }
             }
             isActivate -> {
                 title = if (sorted.all { it.imsRegistered }) "✅ VoLTE 激活成功" else "⚠️ 配置已写入，IMS 未全部注册"
                 body = sorted.joinToString("  ") {
-                    "SIM ${it.slot + 1}: IMS " + if (it.imsRegistered) "已注册" else "未注册"
+                    "${it.label}: IMS " + if (it.imsRegistered) "已注册" else "未注册"
                 }
             }
             else -> {

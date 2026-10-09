@@ -115,18 +115,68 @@ fun readImsStatus(context: Context, slot: Int): ImsStatus {
     }
 }
 
-/** Snapshot of both slots, refreshed periodically by [MainScreen]. */
-data class SlotStatus(val config: CarrierOverrides.State, val ims: ImsStatus)
+/**
+ * Snapshot of one logical SIM slot, refreshed periodically by [MainScreen].
+ * [carrier] and [embedded] are only known when a SIM is active and READ_PHONE_STATE is granted.
+ */
+data class SlotStatus(
+    val slot: Int,
+    val config: CarrierOverrides.State,
+    val ims: ImsStatus,
+    val carrier: String? = null,
+    val embedded: Boolean = false
+) {
+    val hasSim: Boolean get() = config != CarrierOverrides.State.NO_SIM
 
-private fun readSlotStatuses(context: Context): List<SlotStatus> = (0..1).map { slot ->
-    var config = CarrierOverrides.queryState(context, slot)
-    val ims = readImsStatus(context, slot)
-    // Without READ_PHONE_STATE we can't see the SIM list; fall back to what the shell query saw.
-    if (ims == ImsStatus.NO_SIM && config != CarrierOverrides.State.APPLIED && config != CarrierOverrides.State.LOST) {
-        config = CarrierOverrides.State.NO_SIM
-    }
-    SlotStatus(config, if (config == CarrierOverrides.State.NO_SIM) ImsStatus.NO_SIM else ims)
+    /** Carrier name when known (e.g. "中国移动"), otherwise "SIM n". */
+    val title: String get() = carrier ?: "SIM ${slot + 1}"
+
+    /** What kind of slot this is, e.g. "eSIM" vs a physical tray. */
+    val kind: String get() = if (embedded) "eSIM" else "SIM 卡"
 }
+
+/**
+ * Number of logical SIM slots the modem supports. Phones with one physical tray plus eSIM still
+ * report 2 in dual-SIM (DSDS) mode, so empty slots are hidden in the UI rather than listed.
+ */
+private fun modemSlotCount(context: Context): Int {
+    val tm = context.getSystemService(android.telephony.TelephonyManager::class.java) ?: return 1
+    val count = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+        tm.activeModemCount
+    } else {
+        @Suppress("DEPRECATION")
+        tm.phoneCount
+    }
+    return count.coerceIn(1, 2)
+}
+
+private fun readSlotStatuses(context: Context): List<SlotStatus> {
+    val subManager = context.getSystemService(android.telephony.SubscriptionManager::class.java)
+    return (0 until modemSlotCount(context)).map { slot ->
+        var config = CarrierOverrides.queryState(context, slot)
+        val ims = readImsStatus(context, slot)
+        // Without READ_PHONE_STATE we can't see the SIM list; fall back to what the shell query saw.
+        if (ims == ImsStatus.NO_SIM && config != CarrierOverrides.State.APPLIED && config != CarrierOverrides.State.LOST) {
+            config = CarrierOverrides.State.NO_SIM
+        }
+        val sub = if (CarrierOverrides.hasPhonePermission(context)) {
+            try { subManager?.getActiveSubscriptionInfoForSimSlotIndex(slot) } catch (e: Exception) { null }
+        } else {
+            null
+        }
+        SlotStatus(
+            slot = slot,
+            config = config,
+            ims = if (config == CarrierOverrides.State.NO_SIM) ImsStatus.NO_SIM else ims,
+            carrier = sub?.displayName?.toString()?.takeIf { it.isNotBlank() },
+            embedded = sub?.isEmbedded == true
+        )
+    }
+}
+
+/** Slots worth showing: those with a SIM, or just the first slot when none has one. */
+private fun visibleSlots(statuses: List<SlotStatus>): List<SlotStatus> =
+    statuses.filter { it.hasSim }.ifEmpty { statuses.take(1) }
 
 private const val INSTRUMENT_CMD =
     "am instrument -w -e clear %s com.svenuks.imsforpixel/com.svenuks.imsforpixel.BrokerInstrumentation"
@@ -151,8 +201,9 @@ fun MainScreen() {
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
     var slotStatuses by remember {
-        mutableStateOf(List(2) { SlotStatus(CarrierOverrides.State.UNKNOWN, ImsStatus.UNREGISTERED) })
+        mutableStateOf(listOf(SlotStatus(0, CarrierOverrides.State.UNKNOWN, ImsStatus.UNREGISTERED)))
     }
+    var isAuthorized by remember { mutableStateOf(false) }
     // Re-read permission state whenever a permission request completes.
     val permissionEpoch = (context as? MainActivity)?.permissionEpoch?.intValue ?: 0
     var hasPhonePermission by remember { mutableStateOf(CarrierOverrides.hasPhonePermission(context)) }
@@ -176,10 +227,36 @@ fun MainScreen() {
         }
     }
 
-    // Background IMS status polling through the shell (ImsQueryTool via app_process).
-    LaunchedEffect(portInput) {
+    // Auth check: re-run when the port changes or after pairing, and keep retrying every 5s
+    // until authorized. Never runs per 1s tick, to avoid spamming new Kadb connections that
+    // compete with the background IMS polling loop and any active BrokerInstrumentation command.
+    LaunchedEffect(portInput, authEpoch) {
         val port = portInput.toIntOrNull()
-        if (!isValidPort(port)) return@LaunchedEffect
+        if (!isValidPort(port)) {
+            isAuthorized = false
+            return@LaunchedEffect
+        }
+        while (true) {
+            isAuthorized = withContext(Dispatchers.IO) {
+                try {
+                    AdbKeys.await()
+                    Kadb.create("127.0.0.1", port!!, 3000, 3000).use { kadb ->
+                        kadb.shell("echo 1").exitCode == 0
+                    }
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            if (isAuthorized) break
+            delay(5000)
+        }
+    }
+
+    // Background IMS status polling through the shell (ImsQueryTool via app_process).
+    // Only once ADB is authorized; before pairing every attempt would just fail the TLS handshake.
+    LaunchedEffect(portInput, isAuthorized) {
+        val port = portInput.toIntOrNull()
+        if (!isValidPort(port) || !isAuthorized) return@LaunchedEffect
         withContext(Dispatchers.IO) {
             var activeKadb: Kadb? = null
             try {
@@ -378,10 +455,14 @@ fun MainScreen() {
                 }
             }
 
+            val shownSlots = visibleSlots(slotStatuses)
+            // Keep the selection on a slot that is actually shown (e.g. after a SIM is removed).
+            val activeSlot = shownSlots.firstOrNull { it.slot == selectedSimSlot } ?: shownSlots.first()
+
             item(key = "status") {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    for (slot in 0..1) {
-                        SimStatusCard(slot, slotStatuses[slot], Modifier.weight(1f))
+                    for (status in shownSlots) {
+                        SimStatusCard(status, Modifier.weight(1f))
                     }
                 }
             }
@@ -389,9 +470,9 @@ fun MainScreen() {
             item(key = "features-header") { SectionHeader("通话功能") }
             item(key = "features") {
                 FeatureSettings(
-                    selectedSlot = selectedSimSlot,
+                    selected = activeSlot,
+                    slots = shownSlots,
                     onSlotSelected = { selectedSimSlot = it },
-                    slotStatuses = slotStatuses,
                     configEpoch = configEpoch
                 )
             }
@@ -399,7 +480,7 @@ fun MainScreen() {
             item(key = "connection-header") { SectionHeader("无线调试连接") }
             item(key = "connection") {
                 ConnectionSection(
-                    authEpoch = authEpoch,
+                    isAuthorized = isAuthorized,
                     hasLocalNetwork = hasLocalNetwork,
                     portInput = portInput,
                     onPortInputChange = { portInput = it }
@@ -498,8 +579,8 @@ private fun imsBadge(status: ImsStatus): Badge {
 }
 
 @Composable
-private fun SimStatusCard(slot: Int, status: SlotStatus, modifier: Modifier = Modifier) {
-    val noSim = status.config == CarrierOverrides.State.NO_SIM
+private fun SimStatusCard(status: SlotStatus, modifier: Modifier = Modifier) {
+    val noSim = !status.hasSim
     Card(
         modifier = modifier,
         shape = MaterialTheme.shapes.extraLarge,
@@ -515,12 +596,32 @@ private fun SimStatusCard(slot: Int, status: SlotStatus, modifier: Modifier = Mo
                     Icon(Icons.Filled.SimCard, contentDescription = null, modifier = Modifier.padding(8.dp).size(20.dp))
                 }
                 Spacer(Modifier.width(12.dp))
-                Text("SIM ${slot + 1}", style = MaterialTheme.typography.titleMedium)
+                Column {
+                    Text(
+                        if (noSim) "未检测到 SIM 卡" else status.title,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    if (!noSim) {
+                        Text(
+                            status.kind,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
             Spacer(Modifier.height(12.dp))
-            StatusLine(configBadge(status.config))
-            Spacer(Modifier.height(4.dp))
-            StatusLine(imsBadge(status.ims))
+            if (noSim) {
+                Text(
+                    "插入 SIM 卡或启用 eSIM 后即可激活",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                StatusLine(configBadge(status.config))
+                Spacer(Modifier.height(4.dp))
+                StatusLine(imsBadge(status.ims))
+            }
         }
     }
 }
@@ -634,28 +735,32 @@ private val FEATURES = listOf(
 
 @Composable
 private fun FeatureSettings(
-    selectedSlot: Int,
+    selected: SlotStatus,
+    slots: List<SlotStatus>,
     onSlotSelected: (Int) -> Unit,
-    slotStatuses: List<SlotStatus>,
     configEpoch: Int
 ) {
+    val selectedSlot = selected.slot
     val context = LocalContext.current
     val prefs = remember { CarrierOverrides.prefs(context) }
     // Bumped on every toggle so dependent values (pending-change hint) recompute.
     var editEpoch by remember { mutableIntStateOf(0) }
 
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-            for (slot in 0..1) {
-                SegmentedButton(
-                    selected = selectedSlot == slot,
-                    onClick = { onSlotSelected(slot) },
-                    shape = SegmentedButtonDefaults.itemShape(index = slot, count = 2),
-                    icon = { SegmentedButtonDefaults.Icon(active = selectedSlot == slot) {
-                        Icon(Icons.Filled.SimCard, contentDescription = null, modifier = Modifier.size(SegmentedButtonDefaults.IconSize))
-                    } }
-                ) {
-                    Text(if (slotStatuses[slot].config == CarrierOverrides.State.NO_SIM) "SIM ${slot + 1}（未插卡）" else "SIM ${slot + 1}")
+        // Only offer a SIM switcher when more than one SIM is actually in use.
+        if (slots.size > 1) {
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                slots.forEachIndexed { index, slot ->
+                    SegmentedButton(
+                        selected = selectedSlot == slot.slot,
+                        onClick = { onSlotSelected(slot.slot) },
+                        shape = SegmentedButtonDefaults.itemShape(index = index, count = slots.size),
+                        icon = { SegmentedButtonDefaults.Icon(active = selectedSlot == slot.slot) {
+                            Icon(Icons.Filled.SimCard, contentDescription = null, modifier = Modifier.size(SegmentedButtonDefaults.IconSize))
+                        } }
+                    ) {
+                        Text(slot.title)
+                    }
                 }
             }
         }
@@ -684,7 +789,7 @@ private fun FeatureSettings(
         }
 
         // Hint when the toggles no longer match what was applied to this SIM.
-        val pending = remember(selectedSlot, configEpoch, editEpoch, slotStatuses[selectedSlot].config) {
+        val pending = remember(selectedSlot, configEpoch, editEpoch, selected.config) {
             CarrierOverrides.isActivated(prefs, selectedSlot) &&
                 prefs.getString("applied_sig_slot_$selectedSlot", null) !=
                 CarrierOverrides.signature(CarrierOverrides.buildBundle(prefs, selectedSlot))
@@ -717,40 +822,14 @@ private fun StatusIcon(ok: Boolean, pendingColor: Color = MaterialTheme.colorSch
 
 @Composable
 private fun ConnectionSection(
-    authEpoch: Int,
+    isAuthorized: Boolean,
     hasLocalNetwork: Boolean,
     portInput: String,
     onPortInputChange: (String) -> Unit
 ) {
     val context = LocalContext.current
-    var isAuthorized by remember { mutableStateOf(false) }
     var isWifiConnected by remember { mutableStateOf(false) }
     var showAdvanced by rememberSaveable { mutableStateOf(false) }
-
-    // Auth check: re-run when the port changes or after pairing, and keep retrying every 5s
-    // until authorized. Never runs per 1s tick, to avoid spamming new Kadb connections that
-    // compete with the background IMS polling loop and any active BrokerInstrumentation command.
-    LaunchedEffect(portInput, authEpoch) {
-        val port = portInput.toIntOrNull()
-        if (!isValidPort(port)) {
-            isAuthorized = false
-            return@LaunchedEffect
-        }
-        while (true) {
-            isAuthorized = withContext(Dispatchers.IO) {
-                try {
-                    AdbKeys.await()
-                    Kadb.create("127.0.0.1", port!!, 3000, 3000).use { kadb ->
-                        kadb.shell("echo 1").exitCode == 0
-                    }
-                } catch (e: Exception) {
-                    false
-                }
-            }
-            if (isAuthorized) break
-            delay(5000)
-        }
-    }
 
     DisposableEffect(Unit) {
         val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
