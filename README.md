@@ -3,7 +3,7 @@
 > Enable VoLTE, VoNR (5G Calling), and Wi-Fi Calling on Google Pixel devices — **no root required**.
 
 [![Platform](https://img.shields.io/badge/platform-Android%2010--17-brightgreen)](https://developer.android.com)
-[![API](https://img.shields.io/badge/minSdk-28-blue)](https://developer.android.com/about/versions/10)
+[![API](https://img.shields.io/badge/minSdk-29-blue)](https://developer.android.com/about/versions/10)
 [![License](https://img.shields.io/badge/license-MIT-orange)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.0.0-informational)](app/build.gradle)
 [![Tested](https://img.shields.io/badge/tested-Android%2017-success)](https://developer.android.com)
@@ -45,6 +45,9 @@ By merging these two ideas, **IMS for Pixel** is simpler and more convenient tha
 - ✅ **Dual-SIM support** — Independent per-slot configuration
 - ✅ **One-tap restore** — Clear all overrides and return to carrier defaults
 - ✅ **Live IMS status** — Background polling every 3 s
+- ✅ **Real config verification** — Reads the live carrier config to show whether the overrides are actually in effect
+- ✅ **Survives reboots** — Overrides are persisted by the system (until the next system update, see FAQ)
+- ✅ **Update watcher** — Notifies you when a system update has wiped the overrides so you can re-activate
 - ✅ **Notification result** — Real per-slot IMS registration status shown in notification bar after activation
 - ✅ **Tested on Android 10 – 17**
 - 🚫 **No root** required
@@ -77,9 +80,10 @@ By merging these two ideas, **IMS for Pixel** is simpler and more convenient tha
 
 1. The app self-connects to the device's **Wireless Debugging** port via loopback (`127.0.0.1`).
 2. It launches `BrokerInstrumentation` via `am instrument`, which runs under the `shell` permission identity — the same mechanism Shizuku uses, but self-contained.
-3. `BrokerInstrumentation` calls `CarrierConfigManager.overrideConfig` with your chosen settings, resets IMS, and polls registration for up to 30 seconds.
+3. `BrokerInstrumentation` calls `CarrierConfigManager.overrideConfig(subId, bundle, persistent = true)` with your chosen settings, resets IMS, and polls registration for up to 30 seconds. `am instrument` restarts the app's process, so the app UI may close at this point — that is expected.
 4. On completion, a **notification bar** message reports the real per-slot IMS registration result.
 5. A background `ImsQueryTool` process refreshes the in-app IMS status badges every 3 seconds.
+6. The app reads the live carrier config (needs the **Phone** permission) to verify the overrides are still in effect, and `ConfigWatcherReceiver` warns you after a system update wipes them.
 
 ---
 
@@ -87,7 +91,7 @@ By merging these two ideas, **IMS for Pixel** is simpler and more convenient tha
 
 | Requirement | Details |
 |---|---|
-| Android version | Android 10 (API 28) or higher |
+| Android version | Android 10 (API 29) or higher |
 | Tested up to | **Android 17** ✅ |
 | Wi-Fi | Must be connected to a Wi-Fi network |
 | Wireless Debugging | Must be enabled in Developer Options |
@@ -153,6 +157,8 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 app/src/main/java/com/svenuks/imsforpixel/
 ├── MainActivity.kt          # Jetpack Compose UI + mDNS discovery + background IMS polling
 ├── BrokerInstrumentation.kt # Shell-identity runner: overrides carrier config, polls IMS, posts notification
+├── CarrierOverrides.kt      # Override keys + live carrier-config verification
+├── ConfigWatcherReceiver.kt # Warns after an OTA / config change wipes the overrides
 └── ImsQueryTool.kt          # Lightweight app_process entry point for background IMS status queries
 ```
 
@@ -160,6 +166,8 @@ app/src/main/java/com/svenuks/imsforpixel/
 |---|---|
 | `MainActivity.kt` | Full UI (Material 3 / Compose), mDNS service discovery, Kadb ADB client, background IMS refresh |
 | `BrokerInstrumentation.kt` | Privileged patch runner — overrides carrier config, resets IMS, polls registration, posts notification |
+| `CarrierOverrides.kt` | Builds the override bundle; compares the live carrier config with what was applied |
+| `ConfigWatcherReceiver.kt` | On boot / carrier-config change, notifies if the overrides were lost |
 | `ImsQueryTool.kt` | Minimal `app_process` entry point — queries IMS state without UiAutomation overhead |
 
 ---
@@ -172,6 +180,8 @@ app/src/main/java/com/svenuks/imsforpixel/
 | `ACCESS_NETWORK_STATE` | Check Wi-Fi connectivity before ADB pairing |
 | `CHANGE_WIFI_MULTICAST_STATE` | mDNS (NSD) discovery of the Wireless Debugging port |
 | `POST_NOTIFICATIONS` | Show activation result and pairing code in notification bar |
+| `READ_PHONE_STATE` | Read the live carrier config to verify the overrides are in effect |
+| `RECEIVE_BOOT_COMPLETED` | Detect system updates that wiped the overrides |
 
 > No data is ever sent to any external server. All network traffic is loopback `127.0.0.1` only.
 
@@ -186,14 +196,23 @@ app/src/main/java/com/svenuks/imsforpixel/
 | [androidx.compose BOM](https://developer.android.com/jetpack/compose/bom) | 2024.06.00 | Compose UI, Material 3 |
 | [hiddenapibypass](https://github.com/LSPosed/HiddenApiBypass) | 4.3 | Restricted telephony API access on Android 9+ |
 | [kadb](https://github.com/flyfishxu/Kadb) | 2.1.1 | Pure-Kotlin ADB over Wi-Fi |
-| [adblib](https://github.com/tananaev/adblib) | 1.3 | ADB protocol support |
 
 ---
 
 ## FAQ
 
 **Q: Does this survive a reboot?**  
-A: No. `CarrierConfigManager.overrideConfig` overrides are in-memory and reset on reboot. Tap **一键激活** again after each reboot.
+A: Yes, on Android versions that provide the persistent `overrideConfig` overload (the app always uses it when available): the system saves the overrides to disk and restores them on boot. On older versions where only the non-persistent overload exists, they are lost on reboot.
+
+**Q: When do I need to activate again?**  
+A: The system deletes persisted overrides when:
+- **A system update is installed** (the build fingerprint changes) — on Pixel this is usually monthly. The app shows a notification after such an update; just tap **一键激活** again.
+- The platform carrier-config package is updated.
+- You insert a different SIM (overrides are stored per SIM/ICCID; the original SIM keeps its overrides).
+- You factory-reset the phone.
+
+**Q: What happens if I uninstall the app?**  
+A: The overrides live in the system, not in the app, so they **stay** after uninstalling. Tap **一键恢复** before uninstalling if you want carrier defaults back.
 
 **Q: Will this break anything?**  
 A: Tap **一键恢复** (One-tap Restore) at any time to clear all overrides and return to carrier defaults.

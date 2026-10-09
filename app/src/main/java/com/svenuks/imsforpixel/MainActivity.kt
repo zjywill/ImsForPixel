@@ -62,41 +62,6 @@ class MainActivity : ComponentActivity() {
         @JvmStatic
         var pairingPort: Int? = null
         var onAuthStatusChanged: (() -> Unit)? = null
-        // Callback: notified when BrokerInstrumentation finishes (activate or restore)
-        var onInstrumentDone: ((isActivate: Boolean, success: Boolean) -> Unit)? = null
-    }
-
-    fun showImsStatusNotification(isActivate: Boolean) {
-        val channelId = "ims_status_channel"
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(channelId, "IMS 激活状态", NotificationManager.IMPORTANCE_HIGH)
-            getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
-        }
-        // Read actual IMS status from files
-        val slot0 = try { java.io.File(filesDir, "ims_status_0.txt").readText().trim().toBoolean() } catch (e: Exception) { false }
-        val slot1 = try { java.io.File(filesDir, "ims_status_1.txt").readText().trim().toBoolean() } catch (e: Exception) { false }
-        val anyRegistered = slot0 || slot1
-        val title = if (isActivate) {
-            if (anyRegistered) "✅ VoLTE 激活成功" else "⚠️ VoLTE 激活完成"
-        } else {
-            "✅ 配置已恢复默认"
-        }
-        val body = if (isActivate) {
-            buildString {
-                if (slot0) append("SIM 1: IMS 已注册  ") else append("SIM 1: IMS 未注册  ")
-                if (slot1) append("SIM 2: IMS 已注册") else append("SIM 2: IMS 未注册")
-            }
-        } else {
-            "运营商覆盖配置已清除，请测试通话功能是否正常"
-        }
-        val notification = NotificationCompat.Builder(this, channelId)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .build()
-        getSystemService(NotificationManager::class.java)?.notify(203, notification)
     }
 
     private var pairingReceiver: BroadcastReceiver? = null
@@ -168,15 +133,21 @@ class MainActivity : ComponentActivity() {
             registerReceiver(pairingReceiver, filter)
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 102)
-            }
+        // READ_PHONE_STATE lets us read the live carrier config to verify the overrides are in effect.
+        val missing = mutableListOf<String>()
+        if (checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
+            missing += android.Manifest.permission.READ_PHONE_STATE
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            missing += android.Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), 102)
         }
 
         setContent {
-            val recheckSignal = remember { mutableStateOf(System.currentTimeMillis()) }
-            MainScreen(recheckSignal = recheckSignal)
+            MainScreen()
         }
     }
 
@@ -340,28 +311,61 @@ val AccentRed = Color(0xFFEF4444)
 val TextLight = Color(0xFFF8FAFC)
 val TextMuted = Color(0xFF94A3B8)
 
+/** IMS registration as last reported by ImsQueryTool / BrokerInstrumentation. */
+enum class ImsStatus { REGISTERED, UNREGISTERED, NO_SIM }
+
+fun readImsStatus(context: Context, slot: Int): ImsStatus {
+    val text = try {
+        java.io.File(context.filesDir, "ims_status_$slot.txt").readText().trim()
+    } catch (e: Exception) {
+        return ImsStatus.UNREGISTERED
+    }
+    return when (text) {
+        "true" -> ImsStatus.REGISTERED
+        "nosim" -> ImsStatus.NO_SIM
+        else -> ImsStatus.UNREGISTERED
+    }
+}
+
+/** Snapshot of both slots, refreshed periodically by [MainScreen]. */
+data class SlotStatus(val config: CarrierOverrides.State, val ims: ImsStatus)
+
+private fun readSlotStatuses(context: Context): List<SlotStatus> = (0..1).map { slot ->
+    var config = CarrierOverrides.queryState(context, slot)
+    val ims = readImsStatus(context, slot)
+    // Without READ_PHONE_STATE we can't see the SIM list; fall back to what the shell query saw.
+    if (ims == ImsStatus.NO_SIM && config != CarrierOverrides.State.APPLIED && config != CarrierOverrides.State.LOST) {
+        config = CarrierOverrides.State.NO_SIM
+    }
+    SlotStatus(config, if (config == CarrierOverrides.State.NO_SIM) ImsStatus.NO_SIM else ims)
+}
+
+private const val INSTRUMENT_CMD =
+    "am instrument -w -e clear %s com.svenuks.imsforpixel/com.svenuks.imsforpixel.BrokerInstrumentation"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(System.currentTimeMillis()) }) {
+fun MainScreen() {
     var selectedSimSlot by remember { mutableStateOf(0) }
     var portInput by remember { mutableStateOf("") }
     var isApplying by remember { mutableStateOf(false) }
+    // Bumped after pairing so the ADB authorization check re-runs.
+    var authEpoch by remember { mutableStateOf(0) }
+    // Bumped after restore so the toggles reload their values from prefs.
+    var configEpoch by remember { mutableStateOf(0) }
     // True while am instrument is running — pauses background ImsQueryTool polling
     val isInstrumenting = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
 
     val context = LocalContext.current
-    
+    var slotStatuses by remember { mutableStateOf(readSlotStatuses(context)) }
+
     LaunchedEffect(Unit) {
         MainActivity.onAuthStatusChanged = {
-            recheckSignal.value = System.currentTimeMillis()
-        }
-        MainActivity.onInstrumentDone = { isActivate, _ ->
-            (context as? MainActivity)?.showImsStatusNotification(isActivate)
-            recheckSignal.value = System.currentTimeMillis()
+            authEpoch++
         }
         while (true) {
+            slotStatuses = withContext(Dispatchers.IO) { readSlotStatuses(context) }
             delay(1000)
-            recheckSignal.value = System.currentTimeMillis()
         }
     }
 
@@ -386,18 +390,16 @@ fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(Sys
                                     val queryCmd = "export CLASSPATH=$path; app_process /system/bin com.svenuks.imsforpixel.ImsQueryTool"
                                     val queryRes = kadb.shell(queryCmd)
                                     if (queryRes.exitCode == 0) {
-                                        val lines = queryRes.output.lines()
-                                        for (line in lines) {
-                                            if (line.startsWith("RESULT:")) {
-                                                val parts = line.split(":")
-                                                if (parts.size == 3) {
-                                                    val slot = parts[1].toIntOrNull() ?: continue
-                                                    val isImsRegistered = parts[2].trim().toBoolean()
-                                                    val statusFile = java.io.File(context.filesDir, "ims_status_$slot.txt")
-                                                    statusFile.writeText(isImsRegistered.toString())
-                                                    Log.d("LocalAdb", "Updated slot $slot IMS status: $isImsRegistered")
-                                                }
+                                        for (line in queryRes.output.lines()) {
+                                            val parts = line.trim().split(":")
+                                            val slot = parts.getOrNull(1)?.toIntOrNull() ?: continue
+                                            val value = when {
+                                                parts[0] == "RESULT" && parts.size == 3 -> parts[2].toBoolean().toString()
+                                                parts[0] == "NOSIM" -> "nosim"
+                                                else -> continue
                                             }
+                                            java.io.File(context.filesDir, "ims_status_$slot.txt").writeText(value)
+                                            Log.d("LocalAdb", "Updated slot $slot IMS status: $value")
                                         }
                                     }
                                 }
@@ -418,32 +420,32 @@ fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(Sys
 
     val scope = rememberCoroutineScope()
 
-    fun triggerManualApply() {
+    /**
+     * Launches BrokerInstrumentation in the background via ADB and waits for it to finish.
+     * `am instrument` force-stops this package before starting the instrumentation, so this
+     * process (and the UI) may be killed; in that case the broker's own notification reports
+     * the result. If we survive, we wait for its done marker before re-enabling the buttons.
+     */
+    fun runBroker(clear: Boolean) {
         val port = portInput.toIntOrNull()
         if (port == null || port <= 0 || port > 65535) {
             Toast.makeText(context, "请先开启无线调试服务", Toast.LENGTH_SHORT).show()
             return
         }
 
-        // Reset clear flags to false to ensure the configuration overrides are applied
-        val prefs = context.getSharedPreferences("volte_settings", Context.MODE_PRIVATE)
-        prefs.edit()
-            .putBoolean("clear_slot_0", false)
-            .putBoolean("clear_slot_1", false)
-            .commit()
-
         isApplying = true
         isInstrumenting.set(true)
         scope.launch {
-            // Run am instrument synchronously (no nohup/&) so we wait for the real result.
-            // BrokerInstrumentation polls IMS for up to 30s internally; timeout set to 90s.
+            val doneFile = java.io.File(context.filesDir, "broker_done.txt")
+            val startedAt = System.currentTimeMillis()
             val result = withContext(Dispatchers.IO) {
                 try {
-                    Kadb.create("127.0.0.1", port, 90000, 90000).use { kadb ->
-                        val cmd = "nohup am instrument -w -e clear false com.svenuks.imsforpixel/com.svenuks.imsforpixel.BrokerInstrumentation > /dev/null 2>&1 &"
+                    Kadb.create("127.0.0.1", port, 10000, 10000).use { kadb ->
+                        // Detached on purpose: the shell session must outlive this process.
+                        val cmd = "nohup ${INSTRUMENT_CMD.format(clear)} > /dev/null 2>&1 &"
                         val response = kadb.shell(cmd)
                         if (response.exitCode == 0) {
-                            Result.success(response.output)
+                            Result.success(Unit)
                         } else {
                             Result.failure(Exception("Exit code ${response.exitCode}: ${response.output}"))
                         }
@@ -452,81 +454,57 @@ fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(Sys
                     Result.failure(e)
                 }
             }
+            result.onFailure { error ->
+                isApplying = false
+                isInstrumenting.set(false)
+                val action = if (clear) "恢复" else "激活"
+                Toast.makeText(context, "${action}失败: ${error.message}", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+
+            Toast.makeText(context, "已提交，约 30 秒内通知栏会显示结果", Toast.LENGTH_LONG).show()
+            // Broker polls IMS for up to 30s; allow some slack for process startup.
+            withContext(Dispatchers.IO) {
+                val deadline = startedAt + 60_000
+                while (System.currentTimeMillis() < deadline) {
+                    val doneAt = try { doneFile.readText().trim().toLong() } catch (e: Exception) { 0L }
+                    if (doneAt >= startedAt) break
+                    delay(1000)
+                }
+            }
             isApplying = false
             isInstrumenting.set(false)
-            result.fold(
-                onSuccess = {
-                    MainActivity.onInstrumentDone?.invoke(true, true)
-                },
-                onFailure = { error ->
-                    isInstrumenting.set(false)
-                    Toast.makeText(context, "激活失败: ${error.message}", Toast.LENGTH_LONG).show()
-                }
-            )
+            if (clear) configEpoch++
+            slotStatuses = withContext(Dispatchers.IO) { readSlotStatuses(context) }
         }
     }
 
+    fun triggerManualApply() {
+        // Reset clear flags to false to ensure the configuration overrides are applied
+        CarrierOverrides.prefs(context).edit()
+            .putBoolean("clear_slot_0", false)
+            .putBoolean("clear_slot_1", false)
+            .commit()
+        runBroker(clear = false)
+    }
+
     fun triggerManualRestore() {
-        val port = portInput.toIntOrNull()
-        if (port == null || port <= 0 || port > 65535) {
-            Toast.makeText(context, "请先开启无线调试服务", Toast.LENGTH_SHORT).show()
-            return
+        // Reset toggles for both slots back to the app defaults
+        val editor = CarrierOverrides.prefs(context).edit()
+        for (slot in 0..1) {
+            editor.putBoolean("clear_slot_$slot", true)
+                .putBoolean("volte_slot_$slot", true)
+                .putBoolean("vonr_slot_$slot", true)
+                .putBoolean("vowifi_slot_$slot", true)
+                .putBoolean("wfc_roaming_slot_$slot", true)
+                .putBoolean("ss_ut_slot_$slot", true)
+                .putBoolean("show_ims_slot_$slot", true)
+                .putBoolean("allow_apn_slot_$slot", false)
+                .putBoolean("cross_sim_slot_$slot", false)
         }
-
-        isApplying = true
-        isInstrumenting.set(true)
-        scope.launch {
-            
-            // Reset prefs for both slots
-            val prefs = context.getSharedPreferences("volte_settings", Context.MODE_PRIVATE)
-            prefs.edit()
-                .putBoolean("clear_slot_0", true)
-                .putBoolean("clear_slot_1", true)
-                .putBoolean("volte_slot_0", true)
-                .putBoolean("volte_slot_1", true)
-                .putBoolean("vonr_slot_0", true)
-                .putBoolean("vonr_slot_1", true)
-                .putBoolean("vowifi_slot_0", true)
-                .putBoolean("vowifi_slot_1", true)
-                .putBoolean("wfc_roaming_slot_0", true)
-                .putBoolean("wfc_roaming_slot_1", true)
-                .putBoolean("ss_ut_slot_0", true)
-                .putBoolean("ss_ut_slot_1", true)
-                .putBoolean("show_ims_slot_0", true)
-                .putBoolean("show_ims_slot_1", true)
-                .putBoolean("allow_apn_slot_0", false)
-                .putBoolean("allow_apn_slot_1", false)
-                .putBoolean("cross_sim_slot_0", false)
-                .putBoolean("cross_sim_slot_1", false)
-                .commit()
-
-            val result = withContext(Dispatchers.IO) {
-                try {
-                    Kadb.create("127.0.0.1", port, 90000, 90000).use { kadb ->
-                        val cmd = "nohup am instrument -w -e clear true com.svenuks.imsforpixel/com.svenuks.imsforpixel.BrokerInstrumentation > /dev/null 2>&1 &"
-                        val response = kadb.shell(cmd)
-                        if (response.exitCode == 0) {
-                            Result.success(response.output)
-                        } else {
-                            Result.failure(Exception("Exit code ${response.exitCode}: ${response.output}"))
-                        }
-                    }
-                } catch (e: Exception) {
-                    Result.failure(e)
-                }
-            }
-            isApplying = false
-            isInstrumenting.set(false)
-            result.fold(
-                onSuccess = {
-                    MainActivity.onInstrumentDone?.invoke(false, true)
-                },
-                onFailure = { error ->
-                    isInstrumenting.set(false)
-                    Toast.makeText(context, "恢复失败: ${error.message}", Toast.LENGTH_LONG).show()
-                }
-            )
-        }
+        editor.commit()
+        configEpoch++
+        runBroker(clear = true)
     }
 
     MaterialTheme(
@@ -573,10 +551,27 @@ fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(Sys
                     )
                 }
 
+                // Warn when previously applied overrides have been wiped (e.g. after a system update)
+                val lostSlots = slotStatuses.indices.filter { slotStatuses[it].config == CarrierOverrides.State.LOST }
+                if (lostSlots.isNotEmpty()) {
+                    item {
+                        WarningBanner(
+                            "SIM ${lostSlots.joinToString("、") { (it + 1).toString() }} 的配置已失效" +
+                                "（通常是系统更新后被清除），请重新一键激活。"
+                        )
+                    }
+                }
+                if (!CarrierOverrides.hasPhonePermission(context)) {
+                    item {
+                        WarningBanner("未授予「电话」权限，无法检测配置是否仍然生效。")
+                    }
+                }
+
                 // SIM selector tabs
                 item {
                     SimSelectorTabs(
                         selectedSlot = selectedSimSlot,
+                        slotStatuses = slotStatuses,
                         onSlotSelected = { selectedSimSlot = it }
                     )
                 }
@@ -585,15 +580,16 @@ fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(Sys
                 item {
                     ConfigPanel(
                         slotIndex = selectedSimSlot,
-                        recheckSignal = recheckSignal,
-                        onConfigChanged = {}
+                        status = slotStatuses[selectedSimSlot],
+                        configEpoch = configEpoch
                     )
                 }
 
                 // Local Apply Card (Wireless Debugging self-connect)
                 item {
                     LocalAdbCard(
-                        recheckSignal = recheckSignal,
+                        authEpoch = authEpoch,
+                        slotStatuses = slotStatuses,
                         portInput = portInput,
                         onPortInputChange = { portInput = it },
                         isApplying = isApplying,
@@ -606,12 +602,47 @@ fun MainScreen(recheckSignal: MutableState<Long> = remember { mutableStateOf(Sys
     }
 }
 
+@Composable
+fun WarningBanner(text: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(AccentOrange.copy(alpha = 0.15f))
+            .border(1.dp, AccentOrange.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+            .padding(12.dp)
+    ) {
+        Text("⚠️ $text", color = AccentOrange, fontSize = 12.sp)
+    }
+}
+
+/** Badge label + color for a slot's config state. */
+fun configBadge(state: CarrierOverrides.State): Pair<String, Color> = when (state) {
+    CarrierOverrides.State.APPLIED -> "已生效" to AccentGreen
+    CarrierOverrides.State.LOST -> "已失效" to AccentOrange
+    CarrierOverrides.State.DEFAULT -> "系统默认" to TextMuted
+    CarrierOverrides.State.NO_SIM -> "未插卡" to TextMuted
+    CarrierOverrides.State.UNKNOWN -> "未知" to TextMuted
+}
+
+fun imsBadge(status: ImsStatus): Pair<String, Color> = when (status) {
+    ImsStatus.REGISTERED -> "IMS已注册" to AccentGreen
+    ImsStatus.UNREGISTERED -> "IMS未注册" to AccentRed
+    ImsStatus.NO_SIM -> "无 SIM" to TextMuted
+}
+
 
 @Composable
 fun SimSelectorTabs(
     selectedSlot: Int,
+    slotStatuses: List<SlotStatus>,
     onSlotSelected: (Int) -> Unit
 ) {
+    fun label(slot: Int) = if (slotStatuses[slot].config == CarrierOverrides.State.NO_SIM) {
+        "SIM 卡 ${slot + 1}（未插卡）"
+    } else {
+        "SIM 卡 ${slot + 1}"
+    }
     TabRow(
         selectedTabIndex = selectedSlot,
         containerColor = CardBackground,
@@ -629,12 +660,12 @@ fun SimSelectorTabs(
         Tab(
             selected = selectedSlot == 0,
             onClick = { onSlotSelected(0) },
-            text = { Text("SIM 卡 1", fontWeight = FontWeight.Bold) }
+            text = { Text(label(0), fontWeight = FontWeight.Bold) }
         )
         Tab(
             selected = selectedSlot == 1,
             onClick = { onSlotSelected(1) },
-            text = { Text("SIM 卡 2", fontWeight = FontWeight.Bold) }
+            text = { Text(label(1), fontWeight = FontWeight.Bold) }
         )
     }
 }
@@ -642,50 +673,20 @@ fun SimSelectorTabs(
 @Composable
 fun ConfigPanel(
     slotIndex: Int,
-    recheckSignal: MutableState<Long>,
-    onConfigChanged: () -> Unit
+    status: SlotStatus,
+    configEpoch: Int
 ) {
     val context = LocalContext.current
-    val prefs = remember(slotIndex) {
-        context.getSharedPreferences("volte_settings", Context.MODE_PRIVATE)
-    }
+    val prefs = remember(slotIndex) { CarrierOverrides.prefs(context) }
 
-    var voLteEnabled by remember(slotIndex) { mutableStateOf(prefs.getBoolean("volte_slot_$slotIndex", true)) }
-    var voNrEnabled by remember(slotIndex) { mutableStateOf(prefs.getBoolean("vonr_slot_$slotIndex", true)) }
-    var voWifiEnabled by remember(slotIndex) { mutableStateOf(prefs.getBoolean("vowifi_slot_$slotIndex", true)) }
-    var crossSimEnabled by remember(slotIndex) { mutableStateOf(prefs.getBoolean("cross_sim_slot_$slotIndex", false)) } // Default false
-    var wfcRoamingEnabled by remember(slotIndex) { mutableStateOf(prefs.getBoolean("wfc_roaming_slot_$slotIndex", true)) }
-    var ssUtEnabled by remember(slotIndex) { mutableStateOf(prefs.getBoolean("ss_ut_slot_$slotIndex", true)) }
-    var allowApnEdit by remember(slotIndex) { mutableStateOf(prefs.getBoolean("allow_apn_slot_$slotIndex", false)) } // Default false
-    
-    // Load cached IMS registration status from status file updated by PC run
-    var imsRegistered by remember(slotIndex) { mutableStateOf(false) }
-    var configApplied by remember(slotIndex) { mutableStateOf(false) }
-    
-    val signalValue = recheckSignal.value
-    LaunchedEffect(slotIndex, signalValue) {
-        val statusFile = java.io.File(context.filesDir, "ims_status_$slotIndex.txt")
-        imsRegistered = if (statusFile.exists()) {
-            try {
-                statusFile.readText().trim().toBoolean()
-            } catch (e: Exception) {
-                prefs.getBoolean("ims_registered_slot_$slotIndex", false)
-            }
-        } else {
-            prefs.getBoolean("ims_registered_slot_$slotIndex", false)
-        }
+    var voLteEnabled by remember(slotIndex, configEpoch) { mutableStateOf(prefs.getBoolean("volte_slot_$slotIndex", true)) }
+    var voNrEnabled by remember(slotIndex, configEpoch) { mutableStateOf(prefs.getBoolean("vonr_slot_$slotIndex", true)) }
+    var voWifiEnabled by remember(slotIndex, configEpoch) { mutableStateOf(prefs.getBoolean("vowifi_slot_$slotIndex", true)) }
+    var wfcRoamingEnabled by remember(slotIndex, configEpoch) { mutableStateOf(prefs.getBoolean("wfc_roaming_slot_$slotIndex", true)) }
+    var ssUtEnabled by remember(slotIndex, configEpoch) { mutableStateOf(prefs.getBoolean("ss_ut_slot_$slotIndex", true)) }
 
-        val appliedFile = java.io.File(context.filesDir, "config_applied_$slotIndex.txt")
-        configApplied = if (appliedFile.exists()) {
-            try {
-                appliedFile.readText().trim().toBoolean()
-            } catch (e: Exception) {
-                false
-            }
-        } else {
-            false
-        }
-    }
+    val (configText, configColor) = configBadge(status.config)
+    val (imsText, imsColor) = imsBadge(status.ims)
 
     Card(
         modifier = Modifier
@@ -710,12 +711,12 @@ fun ConfigPanel(
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
-                            .background(if (configApplied) AccentGreen.copy(alpha = 0.15f) else BorderColor.copy(alpha = 0.3f))
+                            .background(configColor.copy(alpha = 0.15f))
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
                         Text(
-                            text = if (configApplied) "配置:已应用" else "配置:系统默认",
-                            color = if (configApplied) AccentGreen else TextMuted,
+                            text = "配置:$configText",
+                            color = configColor,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 10.sp
                         )
@@ -724,12 +725,12 @@ fun ConfigPanel(
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
-                            .background(if (imsRegistered) AccentGreen.copy(alpha = 0.15f) else AccentRed.copy(alpha = 0.15f))
+                            .background(imsColor.copy(alpha = 0.15f))
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
                         Text(
-                            text = if (imsRegistered) "IMS:已注册" else "IMS:未注册",
-                            color = if (imsRegistered) AccentGreen else AccentRed,
+                            text = imsText,
+                            color = imsColor,
                             fontWeight = FontWeight.SemiBold,
                             fontSize = 10.sp
                         )
@@ -744,27 +745,22 @@ fun ConfigPanel(
             ToggleRow("启用 VoLTE 通话 (VoLTE)", "允许通过 4G/LTE 网络进行语音通话", voLteEnabled) { 
                 voLteEnabled = it
                 prefs.edit().putBoolean("volte_slot_$slotIndex", it).putBoolean("clear_slot_$slotIndex", false).commit()
-                onConfigChanged()
             }
             ToggleRow("启用 5G 通话 (VoNR)", "启用 5G 独立组网语音通话支持 (VoNR)", voNrEnabled) { 
                 voNrEnabled = it
                 prefs.edit().putBoolean("vonr_slot_$slotIndex", it).putBoolean("clear_slot_$slotIndex", false).commit()
-                onConfigChanged()
             }
             ToggleRow("启用 Wi-Fi 通话 (VoWiFi)", "信号不佳时允许通过 Wi-Fi 进行通话", voWifiEnabled) { 
                 voWifiEnabled = it
                 prefs.edit().putBoolean("vowifi_slot_$slotIndex", it).putBoolean("clear_slot_$slotIndex", false).commit()
-                onConfigChanged()
             }
             ToggleRow("启用 Wi-Fi 通话漫游", "在国际或漫游状态下保持 Wi-Fi 通话启用", wfcRoamingEnabled) { 
                 wfcRoamingEnabled = it
                 prefs.edit().putBoolean("wfc_roaming_slot_$slotIndex", it).putBoolean("clear_slot_$slotIndex", false).commit()
-                onConfigChanged()
             }
             ToggleRow("启用补充业务 (UT)", "启用运营商呼叫转移、呼叫等待等补充网络设置", ssUtEnabled) { 
                 ssUtEnabled = it
                 prefs.edit().putBoolean("ss_ut_slot_$slotIndex", it).putBoolean("clear_slot_$slotIndex", false).commit()
-                onConfigChanged()
             }
         }
     }
@@ -803,7 +799,8 @@ fun ToggleRow(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LocalAdbCard(
-    recheckSignal: MutableState<Long>,
+    authEpoch: Int,
+    slotStatuses: List<SlotStatus>,
     portInput: String,
     onPortInputChange: (String) -> Unit,
     isApplying: Boolean,
@@ -815,54 +812,29 @@ fun LocalAdbCard(
     var pairingPortInput by remember { mutableStateOf("") }
     var showManualPorts by remember { mutableStateOf(false) }
     var isAuthorized by remember { mutableStateOf(false) }
-    var slot0Active by remember { mutableStateOf(false) }
-    var slot1Active by remember { mutableStateOf(false) }
-    var slot0Applied by remember { mutableStateOf(false) }
-    var slot1Applied by remember { mutableStateOf(false) }
     var isWifiConnected by remember { mutableStateOf(false) }
 
-    val signalValue = recheckSignal.value
-    // Auth check: only re-run when portInput changes, NOT on every 1s signal tick.
-    // Running every second would spam new Kadb connections and compete with the
-    // background IMS polling loop and any active BrokerInstrumentation command.
-    LaunchedEffect(portInput) {
+    // Auth check: re-run when the port changes or after pairing, and keep retrying every 5s
+    // until authorized. Never runs per 1s tick, to avoid spamming new Kadb connections that
+    // compete with the background IMS polling loop and any active BrokerInstrumentation command.
+    LaunchedEffect(portInput, authEpoch) {
         val port = portInput.toIntOrNull()
-        if (port != null && port > 0 && port <= 65535) {
-            withContext(Dispatchers.IO) {
+        if (port == null || port <= 0 || port > 65535) {
+            isAuthorized = false
+            return@LaunchedEffect
+        }
+        while (true) {
+            isAuthorized = withContext(Dispatchers.IO) {
                 try {
                     Kadb.create("127.0.0.1", port, 3000, 3000).use { kadb ->
-                        val response = kadb.shell("echo 1")
-                        isAuthorized = (response.exitCode == 0)
+                        kadb.shell("echo 1").exitCode == 0
                     }
                 } catch (e: Exception) {
-                    isAuthorized = false
+                    false
                 }
             }
-        } else {
-            isAuthorized = false
-        }
-    }
-
-    LaunchedEffect(signalValue) {
-        slot0Active = try {
-            java.io.File(context.filesDir, "ims_status_0.txt").readText().trim().toBoolean()
-        } catch (e: Exception) {
-            false
-        }
-        slot1Active = try {
-            java.io.File(context.filesDir, "ims_status_1.txt").readText().trim().toBoolean()
-        } catch (e: Exception) {
-            false
-        }
-        slot0Applied = try {
-            java.io.File(context.filesDir, "config_applied_0.txt").readText().trim().toBoolean()
-        } catch (e: Exception) {
-            false
-        }
-        slot1Applied = try {
-            java.io.File(context.filesDir, "config_applied_1.txt").readText().trim().toBoolean()
-        } catch (e: Exception) {
-            false
+            if (isAuthorized) break
+            delay(5000)
         }
     }
 
@@ -1133,15 +1105,15 @@ fun LocalAdbCard(
                         Text("SIM 卡 1 通话配置", fontSize = 10.sp, color = TextMuted)
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = if (slot0Applied) "App已优化" else "系统默认",
-                            color = if (slot0Applied) AccentGreen else TextMuted,
+                            text = configBadge(slotStatuses[0].config).first,
+                            color = configBadge(slotStatuses[0].config).second,
                             fontWeight = FontWeight.Bold,
                             fontSize = 11.sp
                         )
                         Spacer(modifier = Modifier.height(1.dp))
                         Text(
-                            text = if (slot0Active) "IMS已注册" else "IMS未注册",
-                            color = if (slot0Active) AccentGreen else AccentRed,
+                            text = imsBadge(slotStatuses[0].ims).first,
+                            color = imsBadge(slotStatuses[0].ims).second,
                             fontSize = 9.sp
                         )
                     }
@@ -1158,15 +1130,15 @@ fun LocalAdbCard(
                         Text("SIM 卡 2 通话配置", fontSize = 10.sp, color = TextMuted)
                         Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = if (slot1Applied) "App已优化" else "系统默认",
-                            color = if (slot1Applied) AccentGreen else TextMuted,
+                            text = configBadge(slotStatuses[1].config).first,
+                            color = configBadge(slotStatuses[1].config).second,
                             fontWeight = FontWeight.Bold,
                             fontSize = 11.sp
                         )
                         Spacer(modifier = Modifier.height(1.dp))
                         Text(
-                            text = if (slot1Active) "IMS已注册" else "IMS未注册",
-                            color = if (slot1Active) AccentGreen else AccentRed,
+                            text = imsBadge(slotStatuses[1].ims).first,
+                            color = imsBadge(slotStatuses[1].ims).second,
                             fontSize = 9.sp
                         )
                     }

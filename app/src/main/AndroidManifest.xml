@@ -6,6 +6,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Read the live carrier config to verify overrides are still in effect -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <!-- Detect OTA updates (which wipe persisted overrides) on boot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <!-- Instrumentation for adopting shell permissions to override carrier configs on Android 15/16 -->
     <instrumentation
@@ -13,7 +17,7 @@
         android:targetPackage="com.svenuks.imsforpixel"/>
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"
         android:label="IMS for Pixel"
         android:supportsRtl="true"
@@ -27,6 +31,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <receiver
+            android:name=".ConfigWatcherReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.telephony.action.CARRIER_CONFIG_CHANGED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

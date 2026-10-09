@@ -10,9 +10,10 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // Required by Kadb's transitive dependency (spake2-java)
         maven { url 'https://jitpack.io' }
     }
 }
 
-rootProject.name = "PixelVoLTEEnabler"
+rootProject.name = "ImsForPixel"
 include ':app'

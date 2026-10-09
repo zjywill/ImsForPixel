@@ -105,8 +105,8 @@ class BrokerInstrumentation : Instrumentation() {
                     if (queryOnly) {
                         queryStatusOnly()
                     } else {
-                        patchAllSimsAndPoll(arguments)
-                        showImsStatusNotification(!clearArg)
+                        val results = patchAllSimsAndPoll(arguments)
+                        showImsStatusNotification(!clearArg, results)
                     }
                 } finally {
                     if (uiAutomation != null) {
@@ -121,6 +121,10 @@ class BrokerInstrumentation : Instrumentation() {
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to run instrumentation patch", e)
             } finally {
+                // Signal the UI (if it is still alive) that the run has finished.
+                try {
+                    java.io.File(context.filesDir, "broker_done.txt").writeText(System.currentTimeMillis().toString())
+                } catch (ignored: Exception) {}
                 finish(0, Bundle())
             }
         }.start()
@@ -178,11 +182,40 @@ class BrokerInstrumentation : Instrumentation() {
         }
     }
 
-    private fun patchAllSimsAndPoll(arguments: Bundle?) {
-        val sharedPrefs = context.getSharedPreferences("volte_settings", Context.MODE_PRIVATE)
-        val subManager = context.getSystemService(SubscriptionManager::class.java) ?: return
-        val carrierConfigManager = context.getSystemService(CarrierConfigManager::class.java) ?: return
-        val telephonyManager = context.getSystemService(TelephonyManager::class.java) ?: return
+    /** Per-slot outcome of one broker run. */
+    private data class SlotResult(val slot: Int, val configWritten: Boolean, var imsRegistered: Boolean)
+
+    /**
+     * Invokes CarrierConfigManager.overrideConfig, preferring the 3-arg (persistent) overload.
+     * The 2-arg overload is non-persistent and would neither survive a reboot nor delete a
+     * previously persisted override on restore, so it is only used where the 3-arg one is absent.
+     */
+    private fun invokeOverrideConfig(ccm: CarrierConfigManager, subId: Int, bundle: PersistableBundle?) {
+        val cls = CarrierConfigManager::class.java
+        val persistent = try {
+            cls.getDeclaredMethod(
+                "overrideConfig", Int::class.javaPrimitiveType, PersistableBundle::class.java, Boolean::class.javaPrimitiveType
+            )
+        } catch (e: NoSuchMethodException) {
+            null
+        }
+        if (persistent != null) {
+            persistent.isAccessible = true
+            persistent.invoke(ccm, subId, bundle, true)
+            Log.d(TAG, "overrideConfig(subId=$subId, persistent=true)")
+            return
+        }
+        val legacy = cls.getDeclaredMethod("overrideConfig", Int::class.javaPrimitiveType, PersistableBundle::class.java)
+        legacy.isAccessible = true
+        legacy.invoke(ccm, subId, bundle)
+        Log.w(TAG, "Persistent overrideConfig unavailable; applied non-persistent override for subId=$subId")
+    }
+
+    private fun patchAllSimsAndPoll(arguments: Bundle?): List<SlotResult> {
+        val sharedPrefs = CarrierOverrides.prefs(context)
+        val subManager = context.getSystemService(SubscriptionManager::class.java) ?: return emptyList()
+        val carrierConfigManager = context.getSystemService(CarrierConfigManager::class.java) ?: return emptyList()
+        val telephonyManager = context.getSystemService(TelephonyManager::class.java) ?: return emptyList()
 
         // Under shell permission identity, activeSubscriptionInfoList is accessible directly
         val activeSubscriptions = subManager.activeSubscriptionInfoList ?: emptyList()
@@ -190,6 +223,7 @@ class BrokerInstrumentation : Instrumentation() {
 
         val hasClearArg = arguments?.containsKey("clear") == true
         val clearArg = arguments?.getString("clear") == "true" || arguments?.getBoolean("clear") == true
+        val results = mutableListOf<SlotResult>()
 
         // Phase 1: Apply overrides or Clear overrides, and trigger IMS reset
         for (subInfo in activeSubscriptions) {
@@ -197,89 +231,35 @@ class BrokerInstrumentation : Instrumentation() {
             val slotIndex = subInfo.simSlotIndex
             Log.d(TAG, "Processing SIM slot $slotIndex (SubID $subId)")
 
-            val clear = if (hasClearArg) {
-                clearArg
-            } else {
-                sharedPrefs.getBoolean("clear_slot_$slotIndex", false)
-            }
+            val clear = if (hasClearArg) clearArg else sharedPrefs.getBoolean("clear_slot_$slotIndex", false)
 
+            var written = false
             if (clear) {
                 Log.d(TAG, "Clearing config for slot $slotIndex")
+                // Mark first so ConfigWatcherReceiver doesn't treat the resulting config change as a loss.
+                CarrierOverrides.markCleared(sharedPrefs, slotIndex)
                 try {
-                    val appliedFile = java.io.File(context.filesDir, "config_applied_$slotIndex.txt")
-                    appliedFile.writeText("false")
-                } catch (e: Exception) {}
-                try {
-                    val overrideMethod = findMethod(carrierConfigManager, "overrideConfig")
-                    if (overrideMethod != null) {
-                        val paramTypes = overrideMethod.parameterTypes
-                        if (paramTypes.size == 3) {
-                            overrideMethod.invoke(carrierConfigManager, subId, null, true)
-                        } else {
-                            overrideMethod.invoke(carrierConfigManager, subId, null)
-                        }
-                    }
+                    invokeOverrideConfig(carrierConfigManager, subId, null)
+                    written = true
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to clear carrier config reflectively", e)
                 }
             } else {
-                val volte = sharedPrefs.getBoolean("volte_slot_$slotIndex", true)
-                val vonr = sharedPrefs.getBoolean("vonr_slot_$slotIndex", true)
-                val vowifi = sharedPrefs.getBoolean("vowifi_slot_$slotIndex", true)
-                val crossSim = sharedPrefs.getBoolean("cross_sim_slot_$slotIndex", false)
-                val wfcRoaming = sharedPrefs.getBoolean("wfc_roaming_slot_$slotIndex", true)
-                val ssUt = sharedPrefs.getBoolean("ss_ut_slot_$slotIndex", true)
-                val showIms = sharedPrefs.getBoolean("show_ims_slot_$slotIndex", true)
-                val allowApn = sharedPrefs.getBoolean("allow_apn_slot_$slotIndex", false)
-                val bundle = PersistableBundle()
-                // VoLTE enabling & provisioning overrides
-                bundle.putBoolean("carrier_volte_available_bool", volte)
-                bundle.putBoolean("enhanced_4g_lte_on_by_default_bool", volte)
-                bundle.putBoolean("hide_enhanced_4g_lte_bool", !volte)
-                bundle.putBoolean("editable_enhanced_4g_lte_bool", volte)
-                bundle.putBoolean("carrier_volte_provisioned_bool", volte)
-                bundle.putBoolean("carrier_volte_provisioning_required_bool", false)
-
-                // VoNR (5G Calling) overrides
-                bundle.putBoolean("vonr_enabled_bool", vonr)
-                bundle.putBoolean("vonr_setting_visibility_bool", vonr)
-
-                // VoWiFi (Wi-Fi Calling) overrides
-                bundle.putBoolean("carrier_wfc_ims_available_bool", vowifi)
-                bundle.putBoolean("carrier_default_wfc_ims_enabled_bool", vowifi)
-                bundle.putBoolean("carrier_wfc_ims_provisioned_bool", vowifi)
-                bundle.putBoolean("editable_wfc_mode_bool", vowifi)
-                bundle.putBoolean("editable_wfc_roaming_mode_bool", vowifi)
-                bundle.putBoolean("carrier_default_wfc_ims_roaming_enabled_bool", wfcRoaming)
-
-                // Other settings
-                bundle.putBoolean("carrier_cross_sim_ims_available_bool", crossSim)
-                bundle.putBoolean("enable_cross_sim_calling_on_opportunistic_data_bool", crossSim)
-                bundle.putBoolean("carrier_supports_ss_over_ut_bool", ssUt)
-                bundle.putBoolean("show_ims_registration_status_bool", showIms)
-                bundle.putBoolean("allow_adding_apns_bool", allowApn)
-
-                Log.d(TAG, "Applying config for slot $slotIndex: VoLTE=$volte, VoNR=$vonr, VoWiFi=$vowifi")
-                
+                val bundle = CarrierOverrides.buildBundle(sharedPrefs, slotIndex)
+                Log.d(TAG, "Applying config for slot $slotIndex: $bundle")
+                // Record the snapshot before the call: the CARRIER_CONFIG_CHANGED broadcast it triggers
+                // may reach ConfigWatcherReceiver before this thread continues. Roll back on failure.
+                val previous = sharedPrefs.all
+                CarrierOverrides.markApplied(sharedPrefs, slotIndex, bundle)
                 try {
-                    val overrideMethod = findMethod(carrierConfigManager, "overrideConfig")
-                    if (overrideMethod != null) {
-                        val paramTypes = overrideMethod.parameterTypes
-                        if (paramTypes.size == 3) {
-                            overrideMethod.invoke(carrierConfigManager, subId, bundle, true)
-                        } else {
-                            overrideMethod.invoke(carrierConfigManager, subId, bundle)
-                        }
-                        Log.d(TAG, "Applied config reflectively")
-                        try {
-                            val appliedFile = java.io.File(context.filesDir, "config_applied_$slotIndex.txt")
-                            appliedFile.writeText("true")
-                        } catch (e: Exception) {}
-                    }
+                    invokeOverrideConfig(carrierConfigManager, subId, bundle)
+                    written = true
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to apply config reflectively", e)
+                    CarrierOverrides.restoreActivation(sharedPrefs, slotIndex, previous)
                 }
             }
+            results += SlotResult(slotIndex, written, false)
 
             // Reset IMS registration to force reload
             try {
@@ -291,32 +271,25 @@ class BrokerInstrumentation : Instrumentation() {
             }
         }
 
-        // Do not auto-launch MainActivity early, user will see the prompt/notification
-
         // Phase 2: Poll and update status for up to 30 seconds
         Log.d(TAG, "Entering status polling loop...")
-        var pollsLeft = 30
         val totalPolls = 30
-        while (pollsLeft > 0) {
+        for (secondsElapsed in 0 until totalPolls) {
             var allRegistered = true
             for (subInfo in activeSubscriptions) {
-                val subId = subInfo.subscriptionId
                 val slotIndex = subInfo.simSlotIndex
-                val isImsRegistered = checkImsRegistered(subId)
-                Log.d(TAG, "Poll $pollsLeft: SIM slot $slotIndex IMS Registered: $isImsRegistered")
-                
+                val isImsRegistered = checkImsRegistered(subInfo.subscriptionId)
+                Log.d(TAG, "Poll $secondsElapsed: SIM slot $slotIndex IMS Registered: $isImsRegistered")
+                results.firstOrNull { it.slot == slotIndex }?.imsRegistered = isImsRegistered
+
                 sharedPrefs.edit().putBoolean("ims_registered_slot_$slotIndex", isImsRegistered).commit()
                 try {
-                    val statusFile = java.io.File(context.filesDir, "ims_status_$slotIndex.txt")
-                    statusFile.writeText(isImsRegistered.toString())
+                    java.io.File(context.filesDir, "ims_status_$slotIndex.txt").writeText(isImsRegistered.toString())
                 } catch (e: Exception) {}
 
-                if (!isImsRegistered) {
-                    allRegistered = false
-                }
+                if (!isImsRegistered) allRegistered = false
             }
 
-            val secondsElapsed = totalPolls - pollsLeft
             if (hasClearArg && clearArg) {
                 // When clearing/restoring, wait until it's unregistered
                 if (!allRegistered) {
@@ -324,7 +297,7 @@ class BrokerInstrumentation : Instrumentation() {
                     break
                 }
             } else {
-                // When applying/activating, wait until it's registered
+                // When applying/activating, wait until it's registered.
                 // To avoid stale true values right after reset, only exit early after at least 5 seconds
                 if (allRegistered && secondsElapsed >= 5) {
                     Log.d(TAG, "IMS successfully registered. Stopping poll.")
@@ -335,51 +308,59 @@ class BrokerInstrumentation : Instrumentation() {
             try {
                 Thread.sleep(1000)
             } catch (ignored: Exception) {}
-            pollsLeft--
         }
+        return results
     }
 
-    private fun showImsStatusNotification(isActivate: Boolean) {
+    private fun showImsStatusNotification(isActivate: Boolean, results: List<SlotResult>) {
         val channelId = "ims_status_channel"
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(channelId, "IMS 激活状态", NotificationManager.IMPORTANCE_HIGH)
             notificationManager.createNotificationChannel(ch)
         }
-        
-        // Read actual IMS status from files
-        val slot0 = try { java.io.File(context.filesDir, "ims_status_0.txt").readText().trim().toBoolean() } catch (e: Exception) { false }
-        val slot1 = try { java.io.File(context.filesDir, "ims_status_1.txt").readText().trim().toBoolean() } catch (e: Exception) { false }
-        val anyRegistered = slot0 || slot1
-        val title = if (isActivate) {
-            if (anyRegistered) "✅ VoLTE 激活成功" else "⚠️ VoLTE 激活完成"
-        } else {
-            "✅ 配置已恢复默认"
-        }
-        val body = if (isActivate) {
-            buildString {
-                if (slot0) append("SIM 1: IMS 已注册  ") else append("SIM 1: IMS 未注册  ")
-                if (slot1) append("SIM 2: IMS 已注册") else append("SIM 2: IMS 未注册")
+
+        val sorted = results.sortedBy { it.slot }
+        val title: String
+        val body: String
+        when {
+            sorted.isEmpty() -> {
+                title = "❌ 未检测到可用 SIM 卡"
+                body = "没有找到处于活动状态的 SIM 卡，未做任何修改"
             }
-        } else {
-            "运营商覆盖配置已清除，请测试通话功能是否正常"
+            sorted.any { !it.configWritten } -> {
+                title = if (isActivate) "❌ 配置写入失败" else "❌ 恢复失败"
+                body = sorted.joinToString("  ") {
+                    "SIM ${it.slot + 1}: " + if (it.configWritten) "成功" else "失败"
+                }
+            }
+            isActivate -> {
+                title = if (sorted.all { it.imsRegistered }) "✅ VoLTE 激活成功" else "⚠️ 配置已写入，IMS 未全部注册"
+                body = sorted.joinToString("  ") {
+                    "SIM ${it.slot + 1}: IMS " + if (it.imsRegistered) "已注册" else "未注册"
+                }
+            }
+            else -> {
+                title = "✅ 配置已恢复默认"
+                body = "运营商覆盖配置已清除，请测试通话功能是否正常"
+            }
         }
-        
+
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(context, channelId)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(context)
         }
-        
+
         val notification = builder
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title)
             .setContentText(body)
             .setAutoCancel(true)
             .build()
-            
+
         notificationManager.notify(203, notification)
     }
 }
