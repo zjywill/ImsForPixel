@@ -49,6 +49,7 @@ By merging these two ideas, **IMS for Pixel** is simpler and more convenient tha
 - ✅ **Survives reboots** — Overrides are persisted by the system (until the next system update, see FAQ)
 - ✅ **Update watcher** — Notifies you when a system update has wiped the overrides so you can re-activate
 - ✅ **Notification result** — Real per-slot IMS registration status shown in notification bar after activation
+- ✅ **Material 3 Expressive UI** — Material You dynamic color, light/dark theme, edge-to-edge, predictive back
 - ✅ **Tested on Android 10 – 17**
 - 🚫 **No root** required
 - 🚫 **No Shizuku** or any other privilege manager required
@@ -155,7 +156,10 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ```
 app/src/main/java/com/svenuks/imsforpixel/
-├── MainActivity.kt          # Jetpack Compose UI + mDNS discovery + background IMS polling
+├── MainActivity.kt          # Activity: permissions, pairing notification, ADB key setup
+├── MainScreen.kt            # Material 3 Expressive UI + mDNS discovery + background IMS polling
+├── Theme.kt                 # Dynamic color theme, segmented-list shapes
+├── AdbKeys.kt               # Background ADB key-store initialization
 ├── BrokerInstrumentation.kt # Shell-identity runner: overrides carrier config, polls IMS, posts notification
 ├── CarrierOverrides.kt      # Override keys + live carrier-config verification
 ├── ConfigWatcherReceiver.kt # Warns after an OTA / config change wipes the overrides
@@ -164,7 +168,8 @@ app/src/main/java/com/svenuks/imsforpixel/
 
 | File | Role |
 |---|---|
-| `MainActivity.kt` | Full UI (Material 3 / Compose), mDNS service discovery, Kadb ADB client, background IMS refresh |
+| `MainActivity.kt` | Activity: permissions, pairing notification, ADB key setup |
+| `MainScreen.kt` / `Theme.kt` | Material 3 Expressive Compose UI, mDNS discovery, background IMS refresh |
 | `BrokerInstrumentation.kt` | Privileged patch runner — overrides carrier config, resets IMS, polls registration, posts notification |
 | `CarrierOverrides.kt` | Builds the override bundle; compares the live carrier config with what was applied |
 | `ConfigWatcherReceiver.kt` | On boot / carrier-config change, notifies if the overrides were lost |
@@ -191,9 +196,10 @@ app/src/main/java/com/svenuks/imsforpixel/
 
 | Library | Version | Purpose |
 |---|---|---|
-| [androidx.core:core-ktx](https://developer.android.com/jetpack/androidx/releases/core) | 1.13.1 | Kotlin extensions |
-| [androidx.activity:activity-compose](https://developer.android.com/jetpack/androidx/releases/activity) | 1.9.1 | Compose activity |
-| [androidx.compose BOM](https://developer.android.com/jetpack/compose/bom) | 2024.06.00 | Compose UI, Material 3 |
+| [androidx.core:core-ktx](https://developer.android.com/jetpack/androidx/releases/core) | 1.17.0 | Kotlin extensions |
+| [androidx.activity:activity-compose](https://developer.android.com/jetpack/androidx/releases/activity) | 1.13.0 | Compose activity, edge-to-edge |
+| [androidx.compose BOM](https://developer.android.com/jetpack/compose/bom) | 2026.06.01 | Compose UI |
+| [androidx.compose.material3](https://developer.android.com/jetpack/androidx/releases/compose-material3) | 1.5.0-alpha16 | Material 3 Expressive components |
 | [hiddenapibypass](https://github.com/LSPosed/HiddenApiBypass) | 4.3 | Restricted telephony API access on Android 9+ |
 | [kadb](https://github.com/flyfishxu/Kadb) | 2.1.1 | Pure-Kotlin ADB over Wi-Fi |
 

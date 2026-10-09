@@ -21,7 +21,8 @@
         android:icon="@mipmap/ic_launcher"
         android:label="IMS for Pixel"
         android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+        android:theme="@style/Theme.ImsForPixel"
+        android:enableOnBackInvokedCallback="true"
         tools:targetApi="36">
         <activity
             android:name=".MainActivity"
